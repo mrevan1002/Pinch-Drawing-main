@@ -221,3 +221,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Drawing output files
+*.png
+*.jpg
+*.jpeg
+*.webp
