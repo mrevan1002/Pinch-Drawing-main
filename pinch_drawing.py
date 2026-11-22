@@ -1,12 +1,17 @@
 
+import colorsys
 import cv2
 import mediapipe as mp
 import numpy as np
+import time
+import math
+import os
 
 # ================= CAMERA =================
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 if not cap.isOpened():
     print("Camera could not be opened.")
@@ -14,25 +19,29 @@ if not cap.isOpened():
 
 # ================= HAND TRACKING =================
 mp_hands = mp.solutions.hands
+
 hands = mp_hands.Hands(
+    static_image_mode=False,
     max_num_hands=1,
+    model_complexity=0,
     min_detection_confidence=0.7,
     min_tracking_confidence=0.7
 )
+
 mp_draw = mp.solutions.drawing_utils
 
-# ================= COLORS (BGR) =================
+# ================= COLORS =================
 colors = [
-    (0, 255, 0),       # 1 Green
-    (255, 0, 0),       # 2 Blue
-    (0, 0, 255),       # 3 Red
-    (0, 165, 255),     # 4 Orange
-    (0, 255, 255),     # 5 Yellow
-    (255, 255, 0),     # 6 Cyan
-    (255, 0, 255),     # 7 Magenta
-    (128, 0, 128),     # 8 Purple
-    (255, 255, 255),   # 9 White
-    (0, 0, 0)          # 0 Black
+    (0, 255, 0),
+    (255, 0, 0),
+    (0, 0, 255),
+    (0, 165, 255),
+    (0, 255, 255),
+    (255, 255, 0),
+    (255, 0, 255),
+    (128, 0, 128),
+    (255, 255, 255),
+    (1, 1, 1)
 ]
 
 color_names = [
@@ -41,256 +50,664 @@ color_names = [
 ]
 
 color_index = 0
-brush_size = 6
+brush_thickness = 6
 mode = "brush"
 
-# ================= DRAWING =================
+# ================= DRAWING DATA =================
 strokes = []
-redo_stack = []
+redo_strokes = []
 active_stroke = None
 
-smooth_x = None
-smooth_y = None
-drawing = False
+pinch_start_threshold = 40
+pinch_end_threshold = 55
 
-PINCH_START = 40
-PINCH_END = 55
+smoothed_point = None
+is_drawing = False
+drawing_paused = False
 
-save_number = 1
+canvas = None
+glow_layer = None
+
+clear_armed_until = 0.0
+
+# ================= TOAST NOTIFICATIONS =================
+toast_message = ""
+toast_until = 0.0
 
 
-# ================= RAINBOW =================
-def make_rainbow_color(index, total):
-    hue = int(index * 179 / max(total - 1, 1))
-    hsv = np.uint8([[[hue, 255, 255]]])
-    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-    return tuple(int(v) for v in bgr[0, 0])
+def show_toast(message, duration=2.0):
+    global toast_message, toast_until
+
+    toast_message = message
+    toast_until = time.monotonic() + duration
 
 
-# ================= RENDER =================
-def render_strokes():
-    canvas = np.zeros((480, 640, 3), dtype=np.uint8)
+# ================= UNIQUE FILE NAMES =================
+def unique_filename(prefix):
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    filename = f"{prefix}_{timestamp}.png"
+    counter = 1
+
+    while os.path.exists(filename):
+        filename = f"{prefix}_{timestamp}_{counter}.png"
+        counter += 1
+
+    return filename
+
+
+# ================= TOP UI =================
+def draw_ui(frame):
+    h, w, _ = frame.shape
+    panel_height = min(92, h)
+
+    overlay = frame.copy()
+
+    cv2.rectangle(
+        overlay,
+        (0, 0),
+        (w, panel_height),
+        (20, 20, 20),
+        -1
+    )
+
+    cv2.addWeighted(
+        overlay, 0.75,
+        frame, 0.25,
+        0, frame
+    )
+
+    cv2.putText(
+        frame,
+        "Brush: B   Eraser: E   Neon: N   Rainbow: R   Size: + / -",
+        (12, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.44,
+        (235, 235, 235),
+        1,
+        cv2.LINE_AA
+    )
+
+    cv2.putText(
+        frame,
+        "Undo: U   Redo: Y   Clear: C   Save: S   Camera: F   Pause: P",
+        (12, 46),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.37,
+        (235, 235, 235),
+        1,
+        cv2.LINE_AA
+    )
+
+    status = (
+        f"Color: {color_names[color_index]}    "
+        f"Size: {brush_thickness}    "
+        f"Mode: {mode.capitalize()}"
+    )
+
+    if drawing_paused:
+        status += "    PAUSED"
+
+    cv2.putText(
+        frame,
+        status,
+        (12, 76),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA
+    )
+
+    # Toast notification
+    if toast_message and time.monotonic() < toast_until:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.55
+        thickness = 1
+
+        text_size = cv2.getTextSize(
+            toast_message,
+            font,
+            font_scale,
+            thickness
+        )[0]
+
+        box_width = text_size[0] + 30
+        box_height = 38
+
+        x = max(5, w - box_width - 12)
+        y = min(105, h - box_height - 5)
+
+        cv2.rectangle(
+            frame,
+            (x, y),
+            (x + box_width, y + box_height),
+            (35, 35, 35),
+            -1
+        )
+
+        cv2.rectangle(
+            frame,
+            (x, y),
+            (x + box_width, y + box_height),
+            (80, 200, 120),
+            1
+        )
+
+        cv2.putText(
+            frame,
+            toast_message,
+            (x + 15, y + 25),
+            font,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA
+        )
+
+    return frame
+
+
+# ================= DRAWING FUNCTIONS =================
+def draw_point(stroke, point):
+    thickness = stroke["thickness"]
+    color = stroke["color"]
+    stroke_mode = stroke["mode"]
+
+    if stroke_mode == "eraser":
+        radius = max(4, thickness)
+
+        cv2.circle(canvas, point, radius, (0, 0, 0), -1)
+        cv2.circle(glow_layer, point, radius, (0, 0, 0), -1)
+
+    elif stroke_mode == "neon":
+        cv2.circle(
+            glow_layer, point,
+            max(4, thickness),
+            color, -1, cv2.LINE_AA
+        )
+
+        cv2.circle(
+            canvas, point,
+            max(1, thickness // 2),
+            (245, 245, 245),
+            -1, cv2.LINE_AA
+        )
+
+    elif stroke_mode == "rainbow":
+        cv2.circle(
+            canvas, point,
+            max(1, thickness // 2),
+            (0, 0, 255),
+            -1, cv2.LINE_AA
+        )
+
+    else:
+        cv2.circle(
+            canvas, point,
+            max(1, thickness // 2),
+            color, -1, cv2.LINE_AA
+        )
+
+
+def draw_segment(stroke, p1, p2):
+    thickness = stroke["thickness"]
+    color = stroke["color"]
+    stroke_mode = stroke["mode"]
+
+    movement = float(np.hypot(
+        p2[0] - p1[0],
+        p2[1] - p1[1]
+    ))
+
+    stroke["distance"] += movement
+
+    if stroke_mode == "eraser":
+        radius = max(4, thickness)
+
+        cv2.line(
+            canvas, p1, p2,
+            (0, 0, 0),
+            radius * 2,
+            cv2.LINE_AA
+        )
+
+        cv2.line(
+            glow_layer, p1, p2,
+            (0, 0, 0),
+            radius * 2,
+            cv2.LINE_AA
+        )
+
+        cv2.circle(canvas, p2, radius, (0, 0, 0), -1)
+        cv2.circle(glow_layer, p2, radius, (0, 0, 0), -1)
+
+    elif stroke_mode == "rainbow":
+        hue = (stroke["distance"] * 0.004) % 1.0
+
+        rgb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+
+        rainbow_color = (
+            int(rgb[2] * 255),
+            int(rgb[1] * 255),
+            int(rgb[0] * 255)
+        )
+
+        cv2.line(
+            canvas, p1, p2,
+            rainbow_color,
+            thickness,
+            cv2.LINE_AA
+        )
+
+    elif stroke_mode == "neon":
+        cv2.line(
+            glow_layer, p1, p2,
+            color,
+            thickness + 10,
+            cv2.LINE_AA
+        )
+
+        cv2.line(
+            canvas, p1, p2,
+            color,
+            thickness + 2,
+            cv2.LINE_AA
+        )
+
+        cv2.line(
+            canvas, p1, p2,
+            (245, 245, 245),
+            max(1, thickness // 2),
+            cv2.LINE_AA
+        )
+
+    else:
+        cv2.line(
+            canvas, p1, p2,
+            color,
+            thickness,
+            cv2.LINE_AA
+        )
+
+
+# ================= INTERPOLATION =================
+def add_interpolated_points(new_point):
+    if active_stroke is None:
+        return
+
+    previous = active_stroke["points"][-1]
+
+    dx = new_point[0] - previous[0]
+    dy = new_point[1] - previous[1]
+
+    distance = float(np.hypot(dx, dy))
+
+    max_step = max(
+        2.0,
+        active_stroke["thickness"] * 0.5
+    )
+
+    steps = max(
+        1,
+        int(math.ceil(distance / max_step))
+    )
+
+    for i in range(1, steps + 1):
+        point = (
+            int(round(previous[0] + dx * i / steps)),
+            int(round(previous[1] + dy * i / steps))
+        )
+
+        last_point = active_stroke["points"][-1]
+
+        if point != last_point:
+            active_stroke["points"].append(point)
+
+            draw_segment(
+                active_stroke,
+                last_point,
+                point
+            )
+
+
+# ================= REBUILD CANVAS =================
+def render_stroke(stroke):
+    points = stroke["points"]
+
+    if not points:
+        return
+
+    stroke["distance"] = 0.0
+
+    draw_point(stroke, points[0])
+
+    for i in range(1, len(points)):
+        draw_segment(
+            stroke,
+            points[i - 1],
+            points[i]
+        )
+
+
+def rebuild_canvas():
+    global canvas, glow_layer
+
+    h, w = canvas.shape[:2]
+
+    canvas = np.zeros(
+        (h, w, 3),
+        dtype=np.uint8
+    )
+
+    glow_layer = np.zeros_like(canvas)
 
     for stroke in strokes:
-        points = stroke["points"]
-
-        if not points:
-            continue
-
-        thickness = stroke["size"]
-        stroke_mode = stroke["mode"]
-        color = stroke["color"]
-
-        if stroke_mode == "eraser":
-            draw_color = (0, 0, 0)
-        else:
-            draw_color = color
-
-        if len(points) == 1:
-            cv2.circle(
-                canvas, points[0],
-                max(thickness // 2, 1),
-                draw_color, -1, cv2.LINE_AA
-            )
-
-        for i in range(1, len(points)):
-            segment_color = draw_color
-
-            if stroke_mode == "rainbow":
-                segment_color = make_rainbow_color(i, len(points))
-
-            cv2.line(
-                canvas, points[i - 1], points[i],
-                segment_color, thickness, cv2.LINE_AA
-            )
-
-    if active_stroke is not None:
-        points = active_stroke["points"]
-
-        if points:
-            thickness = active_stroke["size"]
-            color = active_stroke["color"]
-            stroke_mode = active_stroke["mode"]
-
-            draw_color = (0, 0, 0) if stroke_mode == "eraser" else color
-
-            if len(points) == 1:
-                cv2.circle(
-                    canvas, points[0],
-                    max(thickness // 2, 1),
-                    draw_color, -1, cv2.LINE_AA
-                )
-
-            for i in range(1, len(points)):
-                segment_color = draw_color
-
-                if stroke_mode == "rainbow":
-                    segment_color = make_rainbow_color(i, len(points))
-
-                cv2.line(
-                    canvas, points[i - 1], points[i],
-                    segment_color, thickness, cv2.LINE_AA
-                )
-
-    if any(s["mode"] == "neon" for s in strokes) or (
-        active_stroke is not None and active_stroke["mode"] == "neon"
-    ):
-        glow = cv2.GaussianBlur(canvas, (0, 0), 10)
-        canvas = cv2.addWeighted(canvas, 1.0, glow, 0.8, 0)
-
-    return canvas
+        render_stroke(stroke)
 
 
-# ================= STROKE CONTROL =================
+# ================= FINISH STROKE =================
 def finish_stroke():
-    global active_stroke
+    global active_stroke, is_drawing
+
+    is_drawing = False
 
     if active_stroke is not None:
         if active_stroke["points"]:
             strokes.append(active_stroke)
-            redo_stack.clear()
 
         active_stroke = None
-
-
-def add_point(x, y):
-    global active_stroke
-
-    if active_stroke is None:
-        active_stroke = {
-            "points": [],
-            "color": colors[color_index],
-            "size": brush_size,
-            "mode": mode
-        }
-
-    active_stroke["points"].append((x, y))
 
 
 # ================= MAIN LOOP =================
-while True:
-    ret, frame = cap.read()
+try:
+    while True:
+        success, frame = cap.read()
 
-    if not ret:
-        print("Camera frame could not be read.")
-        break
+        if not success:
+            break
 
-    frame = cv2.flip(frame, 1)
-    h, w, _ = frame.shape
+        frame = cv2.flip(frame, 1)
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb)
+        # Original camera image without hand landmarks or UI
+        camera_background = frame.copy()
 
-    # ================= HAND DETECTED =================
-    if results.multi_hand_landmarks:
-        hand = results.multi_hand_landmarks[0]
+        h, w, _ = frame.shape
 
-        mp_draw.draw_landmarks(
-            frame, hand, mp_hands.HAND_CONNECTIONS
+        if canvas is None:
+            canvas = np.zeros(
+                (h, w, 3),
+                dtype=np.uint8
+            )
+
+            glow_layer = np.zeros_like(canvas)
+
+        rgb_frame = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2RGB
         )
 
-        thumb = hand.landmark[4]
-        index = hand.landmark[8]
+        results = hands.process(rgb_frame)
 
-        tx, ty = int(thumb.x * w), int(thumb.y * h)
-        ix, iy = int(index.x * w), int(index.y * h)
+        if results.multi_hand_landmarks:
+            hand_landmarks = results.multi_hand_landmarks[0]
 
-        distance = np.hypot(tx - ix, ty - iy)
+            mp_draw.draw_landmarks(
+                frame,
+                hand_landmarks,
+                mp_hands.HAND_CONNECTIONS
+            )
 
-        if smooth_x is None:
-            smooth_x, smooth_y = ix, iy
+            thumb = hand_landmarks.landmark[4]
+            index = hand_landmarks.landmark[8]
+
+            thumb_x = int(thumb.x * w)
+            thumb_y = int(thumb.y * h)
+
+            index_x = int(index.x * w)
+            index_y = int(index.y * h)
+
+            current_point = (index_x, index_y)
+
+            pinch_distance = np.hypot(
+                index_x - thumb_x,
+                index_y - thumb_y
+            )
+
+            # Original smoothing
+            if smoothed_point is None:
+                smoothed_point = current_point
+            else:
+                smoothed_point = (
+                    int(
+                        0.75 * smoothed_point[0]
+                        + 0.25 * current_point[0]
+                    ),
+                    int(
+                        0.75 * smoothed_point[1]
+                        + 0.25 * current_point[1]
+                    )
+                )
+
+            # Drawing is completely disabled during pause
+            if drawing_paused:
+                if is_drawing:
+                    finish_stroke()
+
+            else:
+                # Start drawing
+                if (
+                    not is_drawing
+                    and pinch_distance < pinch_start_threshold
+                ):
+                    is_drawing = True
+                    redo_strokes.clear()
+
+                    active_stroke = {
+                        "points": [smoothed_point],
+                        "color": colors[color_index],
+                        "thickness": brush_thickness,
+                        "mode": mode,
+                        "distance": 0.0
+                    }
+
+                    draw_point(
+                        active_stroke,
+                        smoothed_point
+                    )
+
+                # Continue drawing
+                elif (
+                    is_drawing
+                    and pinch_distance < pinch_end_threshold
+                ):
+                    if active_stroke is not None:
+                        add_interpolated_points(smoothed_point)
+
+                # Stop drawing
+                elif is_drawing:
+                    finish_stroke()
+
+            # Cursor
+            cursor_color = (
+                (200, 200, 200)
+                if mode == "eraser"
+                else colors[color_index]
+            )
+
+            cv2.circle(
+                frame,
+                smoothed_point,
+                7,
+                cursor_color,
+                -1 if is_drawing else 2,
+                cv2.LINE_AA
+            )
+
+            if is_drawing:
+                cv2.circle(
+                    frame,
+                    smoothed_point,
+                    7,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA
+                )
+
         else:
-            smooth_x = int(0.75 * smooth_x + 0.25 * ix)
-            smooth_y = int(0.75 * smooth_y + 0.25 * iy)
+            if is_drawing:
+                finish_stroke()
 
-        if not drawing and distance < PINCH_START:
-            drawing = True
+            smoothed_point = None
 
-        elif drawing and distance > PINCH_END:
-            drawing = False
-            finish_stroke()
+        # ================= GLOW EFFECT =================
+        if np.any(glow_layer):
+            blurred = cv2.GaussianBlur(
+                glow_layer,
+                (21, 21),
+                0
+            )
 
-        if drawing:
-            add_point(smooth_x, smooth_y)
+            display_canvas = cv2.addWeighted(
+                canvas,
+                1.0,
+                blurred,
+                0.85,
+                0
+            )
+        else:
+            display_canvas = canvas
 
-    else:
-        drawing = False
-        finish_stroke()
-        smooth_x, smooth_y = None, None
+        # ================= DISPLAY DRAWING =================
+        mask = cv2.cvtColor(
+            display_canvas,
+            cv2.COLOR_BGR2GRAY
+        ) > 0
 
-    # ================= DISPLAY CANVAS =================
-    canvas = render_strokes()
+        # Camera + drawing image for F key
+        camera_drawing_frame = camera_background.copy()
+        camera_drawing_frame[mask] = display_canvas[mask]
 
-    gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
-    drawing_mask = gray > 0
-    frame[drawing_mask] = canvas[drawing_mask]
+        # Normal application display
+        frame[mask] = display_canvas[mask]
 
-    # ================= CLEAN SCREEN =================
-    cv2.imshow("Gesture Paint Studio", frame)
+        frame = draw_ui(frame)
 
-    # ================= KEYBOARD =================
-    key = cv2.waitKey(1) & 0xFF
+        cv2.imshow("Pinch Drawing", frame)
 
-    if ord("1") <= key <= ord("9"):
-        finish_stroke()
-        color_index = key - ord("1")
-        mode = "brush"
+        # ================= KEYBOARD =================
+        key = cv2.waitKey(1) & 0xFF
 
-    elif key == ord("0"):
-        finish_stroke()
-        color_index = 9
-        mode = "brush"
+        if key == ord("q"):
+            break
 
-    elif key == ord("u"):
-        finish_stroke()
-        if strokes:
-            redo_stack.append(strokes.pop())
+        # Drawing Pause
+        elif key == ord("p"):
+            drawing_paused = not drawing_paused
 
-    elif key == ord("y"):
-        finish_stroke()
-        if redo_stack:
-            strokes.append(redo_stack.pop())
+            if drawing_paused:
+                finish_stroke()
+                show_toast("Drawing paused")
+            else:
+                show_toast("Drawing resumed")
 
-    elif key == ord("e"):
-        finish_stroke()
-        mode = "eraser"
+        elif ord("1") <= key <= ord("9"):
+            color_index = key - ord("1")
+            mode = "brush"
 
-    elif key == ord("b"):
-        finish_stroke()
-        mode = "brush"
+        elif key == ord("0"):
+            color_index = 9
+            mode = "brush"
 
-    elif key == ord("n"):
-        finish_stroke()
-        mode = "neon"
+        elif key == ord("b"):
+            mode = "brush"
 
-    elif key == ord("r"):
-        finish_stroke()
-        mode = "rainbow"
+        elif key == ord("e"):
+            mode = "eraser"
 
-    elif key in (ord("+"), ord("=")):
-        brush_size = min(brush_size + 2, 50)
+        elif key == ord("n"):
+            mode = "neon"
 
-    elif key == ord("-"):
-        brush_size = max(brush_size - 2, 2)
+        elif key == ord("r"):
+            mode = "rainbow"
 
-    elif key == ord("s"):
-        finish_stroke()
-        canvas = render_strokes()
-        filename = f"drawing_{save_number}.png"
-        cv2.imwrite(filename, canvas)
-        print(f"Saved: {filename}")
-        save_number += 1
+        # Undo
+        elif key == ord("u"):
+            if active_stroke is not None:
+                finish_stroke()
 
-    elif key == ord("c"):
-        strokes.clear()
-        redo_stack.clear()
-        active_stroke = None
+            if strokes:
+                redo_strokes.append(strokes.pop())
+                rebuild_canvas()
 
-    elif key == ord("q"):
-        break
+        # Redo
+        elif key == ord("y"):
+            if active_stroke is not None:
+                finish_stroke()
 
+            if redo_strokes:
+                strokes.append(redo_strokes.pop())
+                rebuild_canvas()
 
-# ================= CLEANUP =================
-cap.release()
-hands.close()
-cv2.destroyAllWindows()
+        # Brush size
+        elif key in (ord("+"), ord("=")):
+            brush_thickness = min(
+                brush_thickness + 2,
+                50
+            )
+
+        elif key == ord("-"):
+            brush_thickness = max(
+                brush_thickness - 2,
+                2
+            )
+
+        # Clear confirmation
+        elif key == ord("c"):
+            now = time.monotonic()
+
+            if now <= clear_armed_until:
+                strokes.clear()
+                redo_strokes.clear()
+                active_stroke = None
+                is_drawing = False
+
+                rebuild_canvas()
+
+                clear_armed_until = 0.0
+                show_toast("Canvas cleared!")
+
+            else:
+                clear_armed_until = now + 2.5
+                show_toast("Press C again to clear", 2.5)
+
+        # Save drawing only
+        elif key == ord("s"):
+            if active_stroke is not None:
+                finish_stroke()
+
+            filename = unique_filename("drawing")
+
+            if cv2.imwrite(filename, canvas):
+                show_toast("Drawing saved!")
+                print(f"Drawing saved as {filename}")
+            else:
+                show_toast("Save failed!")
+
+        # Save camera + drawing
+        elif key == ord("f"):
+            if active_stroke is not None:
+                finish_stroke()
+
+            filename = unique_filename("camera_drawing")
+
+            if cv2.imwrite(filename, camera_drawing_frame):
+                show_toast("Camera image saved!")
+                print(f"Camera image saved as {filename}")
+            else:
+                show_toast("Save failed!")
+
+finally:
+    hands.close()
+    cap.release()
+    cv2.destroyAllWindows()
